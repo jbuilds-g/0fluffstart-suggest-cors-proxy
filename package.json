@@ -1,14 +1,20 @@
 {
-  "name": "proxy",
+  "name": "0fluffstart-suggest-cors-proxy",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "A privacy-first CORS proxy built on Cloudflare Workers for search suggestions.",
+  "main": "src/index.ts",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": [
+    "cloudflare-workers",
+    "cors-proxy",
+    "search-suggestions",
+    "privacy"
+  ],
+  "author": "jbuilds-g",
+  "license": "MIT",
   "type": "commonjs",
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260804.1",
