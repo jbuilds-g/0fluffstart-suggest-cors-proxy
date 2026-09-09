@@ -33,7 +33,7 @@ function getAllowedOrigin(request: Request): string | null {
   try {
     const parsed = new URL(origin);
 
-    if (parsed.origin === "https://jbuilds-g.github.io") {
+    if (parsed.origin === "https://0fluffstart.pages.dev") {
       return parsed.origin;
     }
 
