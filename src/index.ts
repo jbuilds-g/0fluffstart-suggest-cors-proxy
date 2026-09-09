@@ -38,10 +38,16 @@ function getAllowedOrigin(request: Request): string | null {
     }
 
     if (
-      (parsed.protocol === "http:" &&
-        ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)) ||
-      (parsed.protocol === "chrome-extension:" && parsed.hostname) ||
-      (parsed.protocol === "moz-extension:" && parsed.hostname)
+      parsed.protocol === "http:" &&
+      ["localhost", "127.0.0.1", "::1"].includes(parsed.hostname)
+    ) {
+      return parsed.origin;
+    }
+
+    if (
+      (parsed.protocol === "chrome-extension:" ||
+        parsed.protocol === "moz-extension:") &&
+      parsed.hostname
     ) {
       return parsed.origin;
     }
@@ -151,10 +157,14 @@ export default {
 
     if (request.method === "OPTIONS") {
       if (!allowedOrigin) {
-        return createResponse(JSON.stringify({ error: "Forbidden Origin" }), {
-          status: 403,
-          headers: { "Content-Type": "application/json" },
-        }, null);
+        return createResponse(
+          JSON.stringify({ error: "Forbidden Origin" }),
+          {
+            status: 403,
+            headers: { "Content-Type": "application/json" },
+          },
+          null,
+        );
       }
 
       return createCorsResponse(null, { status: 204 }, allowedOrigin);
@@ -162,17 +172,28 @@ export default {
 
     const requestOrigin = request.headers.get("Origin");
     if (requestOrigin && !allowedOrigin) {
-      return createResponse(JSON.stringify({ error: "Forbidden Origin" }), {
-        status: 403,
-        headers: { "Content-Type": "application/json" },
-      }, null);
+      return createResponse(
+        JSON.stringify({ error: "Forbidden Origin" }),
+        {
+          status: 403,
+          headers: { "Content-Type": "application/json" },
+        },
+        null,
+      );
     }
 
     if (request.method !== "GET") {
-      return createResponse(JSON.stringify({ error: "Method Not Allowed" }), {
-        status: 405,
-        headers: { "Content-Type": "application/json", Allow: "GET, OPTIONS" },
-      }, allowedOrigin);
+      return createResponse(
+        JSON.stringify({ error: "Method Not Allowed" }),
+        {
+          status: 405,
+          headers: {
+            "Content-Type": "application/json",
+            Allow: "GET, OPTIONS",
+          },
+        },
+        allowedOrigin,
+      );
     }
 
     const url = new URL(request.url);
@@ -295,9 +316,10 @@ export default {
         allowedOrigin,
       );
     } catch (error) {
-      const message = error instanceof Error && error.name === "AbortError"
-        ? "Upstream request timed out"
-        : "Failed to connect to upstream search engine";
+      const message =
+        error instanceof Error && error.name === "AbortError"
+          ? "Upstream request timed out"
+          : "Failed to connect to upstream search engine";
 
       return createResponse(
         JSON.stringify({ error: message }),
