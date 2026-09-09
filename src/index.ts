@@ -1,39 +1,23 @@
 /**
  * Cloudflare Worker: Search Suggestions Proxy
  *
- * Handles client requests for autosuggest/search completions from various
- * upstream search providers (Google, Bing, DuckDuckGo, Brave), enforcing CORS,
- * auth checks, and KV-backed rate limiting.
+ * Public browser-facing proxy for autosuggest/search completions from Google,
+ * Bing, DuckDuckGo, and Brave. The Worker does not intentionally log requests
+ * or forward client IP metadata to upstream providers.
  */
 
-// ============================================================================
-// Types & Interfaces
-// ============================================================================
-
-/**
- * Environment bindings injected into the Cloudflare Worker runtime.
- */
 export interface Env {
-  /** Optional secret token used to authenticate incoming request headers. */
-  AUTH_SECRET: string;
-  /** KV namespace instance used for IP-based rate limiting. */
   RATE_LIMIT_KV: KVNamespace;
 }
 
-// ============================================================================
-// Constants & Configuration
-// ============================================================================
-
-/** Maximum allowed requests per minute per IP address. */
 const MAX_REQUESTS_PER_MIN = 40;
+const MAX_QUERY_LENGTH = 200;
+const MAX_UPSTREAM_RESPONSE_BYTES = 64 * 1024;
+const UPSTREAM_TIMEOUT_MS = 5000;
 
-/** Default User-Agent string sent to upstream search providers to prevent blocking. */
 const BROWSER_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36";
 
-/**
- * Mapping of supported engine identifiers to their corresponding suggestion API endpoints.
- */
 const SEARCH_ENGINES: Record<string, (query: string) => string> = {
   google: (q) =>
     `https://suggestqueries.google.com/complete/search?client=chrome&q=${q}`,
@@ -42,18 +26,64 @@ const SEARCH_ENGINES: Record<string, (query: string) => string> = {
   brave: (q) => `https://search.brave.com/api/suggest?q=${q}`,
 };
 
-// ============================================================================
-// Helper Utilities
-// ============================================================================
+function getAllowedOrigin(request: Request): string | null {
+  const origin = request.headers.get("Origin");
+  if (!origin) return null;
 
-/**
- * Determines whether the requesting IP has exceeded the allowed request rate.
- * Uses a fixed 1-minute window backed by Cloudflare KV.
- *
- * @param clientIp The client's IP address (typically from `CF-Connecting-IP`).
- * @param kv The KV namespace used for tracking request counts.
- * @returns Resolves to `true` if the IP is rate-limited, otherwise `false`.
- */
+  try {
+    const parsed = new URL(origin);
+
+    if (parsed.origin === "https://jbuilds-g.github.io") {
+      return parsed.origin;
+    }
+
+    if (
+      (parsed.protocol === "http:" &&
+        ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)) ||
+      (parsed.protocol === "chrome-extension:" && parsed.hostname) ||
+      (parsed.protocol === "moz-extension:" && parsed.hostname)
+    ) {
+      return parsed.origin;
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+function createResponse(
+  body: BodyInit | null,
+  options: ResponseInit,
+  allowedOrigin: string | null,
+): Response {
+  const headers = new Headers(options.headers);
+
+  if (allowedOrigin) {
+    headers.set("Access-Control-Allow-Origin", allowedOrigin);
+    headers.set("Vary", "Origin");
+  }
+
+  headers.set("X-Content-Type-Options", "nosniff");
+  return new Response(body, { ...options, headers });
+}
+
+function createCorsResponse(
+  body: BodyInit | null,
+  options: ResponseInit,
+  allowedOrigin: string,
+): Response {
+  const headers = new Headers(options.headers);
+  headers.set("Access-Control-Allow-Origin", allowedOrigin);
+  headers.set("Access-Control-Allow-Headers", "Content-Type");
+  headers.set("Access-Control-Allow-Methods", "GET, OPTIONS");
+  headers.set("Access-Control-Max-Age", "86400");
+  headers.set("Vary", "Origin");
+  headers.set("X-Content-Type-Options", "nosniff");
+
+  return new Response(body, { ...options, headers });
+}
+
 async function isRateLimitedKV(
   clientIp: string,
   kv: KVNamespace,
@@ -61,136 +91,127 @@ async function isRateLimitedKV(
   if (!kv) return false;
 
   const windowKey = `rl:${clientIp}:${Math.floor(Date.now() / 60000)}`;
-  const current = await kv.get(windowKey);
-  const count = current ? parseInt(current, 10) : 0;
 
-  if (count >= MAX_REQUESTS_PER_MIN) {
-    return true;
+  try {
+    const current = await kv.get(windowKey);
+    const count = current ? Number.parseInt(current, 10) : 0;
+
+    if (!Number.isFinite(count) || count >= MAX_REQUESTS_PER_MIN) {
+      return count >= MAX_REQUESTS_PER_MIN;
+    }
+
+    await kv.put(windowKey, String(count + 1), { expirationTtl: 120 });
+  } catch {
+    // KV is best-effort protection. A KV failure must not take down the public API.
   }
 
-  await kv.put(windowKey, (count + 1).toString(), { expirationTtl: 120 });
   return false;
 }
 
-/**
- * Validates and extracts the allowed origin header from incoming HTTP request.
- * Allows specific allowed domains, browser extension origins, and local environments.
- *
- * @param request The incoming HTTP Request object.
- * @returns The allowed origin string or `null` if forbidden.
- */
-function getAllowedOrigin(request: Request): string | null {
-  const origin =
-    request.headers.get("Origin") || request.headers.get("Referer");
-
-  if (!origin) return "*";
-
-  if (
-    origin === "https://jbuilds-g.github.io" ||
-    origin.startsWith("chrome-extension://") ||
-    origin.startsWith("moz-extension://") ||
-    origin.startsWith("http://localhost") ||
-    origin.startsWith("http://127.0.0.1")
-  ) {
-    return origin.startsWith("chrome-extension://") ||
-      origin.startsWith("moz-extension://")
-      ? new URL(origin).origin
-      : origin;
+async function readUpstreamBody(response: Response): Promise<string | null> {
+  const contentLength = response.headers.get("Content-Length");
+  if (contentLength && Number(contentLength) > MAX_UPSTREAM_RESPONSE_BYTES) {
+    return null;
   }
 
-  return "*";
+  if (!response.body) {
+    const text = await response.text();
+    return text.length <= MAX_UPSTREAM_RESPONSE_BYTES ? text : null;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let totalBytes = 0;
+  let result = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      totalBytes += value.byteLength;
+      if (totalBytes > MAX_UPSTREAM_RESPONSE_BYTES) {
+        await reader.cancel();
+        return null;
+      }
+
+      result += decoder.decode(value, { stream: true });
+    }
+
+    result += decoder.decode();
+    return result;
+  } finally {
+    reader.releaseLock();
+  }
 }
-
-/**
- * Creates a standard Response object pre-configured with required CORS headers.
- *
- * @param body The payload body to attach to the response.
- * @param options Additional response initialization settings (status, headers).
- * @param allowedOrigin The validated origin header string.
- * @returns A Response object containing the appended CORS headers.
- */
-function createCORSResponse(
-  body: BodyInit | null,
-  options: ResponseInit,
-  allowedOrigin: string,
-): Response {
-  const headers = new Headers(options.headers);
-  headers.set("Access-Control-Allow-Origin", allowedOrigin);
-  headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  headers.set("Access-Control-Allow-Methods", "GET, OPTIONS");
-
-  return new Response(body, { ...options, headers });
-}
-
-// ============================================================================
-// Main Fetch Handler
-// ============================================================================
 
 export default {
-  /**
-   * Main entry point for Cloudflare Worker fetch events.
-   *
-   * Handles CORS preflight requests, authorization tokens, rate limiting,
-   * parameter validation, and proxying requests to upstream search endpoints.
-   */
-  async fetch(
-    request: Request,
-    env: Env,
-    ctx: ExecutionContext,
-  ): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const allowedOrigin = getAllowedOrigin(request);
 
-    // Handle OPTIONS Preflight Requests
     if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: {
-          "Access-Control-Allow-Origin":
-            allowedOrigin || "https://jbuilds-g.github.io",
-          "Access-Control-Allow-Methods": "GET, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization",
-          "Access-Control-Max-Age": "86400",
-        },
-      });
+      if (!allowedOrigin) {
+        return createResponse(JSON.stringify({ error: "Forbidden Origin" }), {
+          status: 403,
+          headers: { "Content-Type": "application/json" },
+        }, null);
+      }
+
+      return createCorsResponse(null, { status: 204 }, allowedOrigin);
     }
 
-    // Origin Check
-    if (!allowedOrigin) {
-      return new Response(JSON.stringify({ error: "Forbidden Origin" }), {
+    const requestOrigin = request.headers.get("Origin");
+    if (requestOrigin && !allowedOrigin) {
+      return createResponse(JSON.stringify({ error: "Forbidden Origin" }), {
         status: 403,
         headers: { "Content-Type": "application/json" },
-      });
+      }, null);
     }
 
-    // Bearer Token Authorization Check
-    if (env.AUTH_SECRET) {
-      const authHeader = request.headers.get("Authorization");
-      const token = authHeader?.startsWith("Bearer ")
-        ? authHeader.substring(7)
-        : null;
+    if (request.method !== "GET") {
+      return createResponse(JSON.stringify({ error: "Method Not Allowed" }), {
+        status: 405,
+        headers: { "Content-Type": "application/json", Allow: "GET, OPTIONS" },
+      }, allowedOrigin);
+    }
 
-      if (!token || token !== env.AUTH_SECRET) {
-        return createCORSResponse(
-          JSON.stringify({ error: "Unauthorized access" }),
-          {
-            status: 401,
-            headers: { "Content-Type": "application/json" },
+    const url = new URL(request.url);
+    const pathEngine = url.pathname.replace(/^\/+|\/+$/g, "").toLowerCase();
+    const engineKey = Object.hasOwn(SEARCH_ENGINES, pathEngine)
+      ? pathEngine
+      : url.searchParams.get("engine")?.trim().toLowerCase() ?? "";
+    const query = url.searchParams.get("q")?.trim() ?? "";
+
+    if (
+      !engineKey ||
+      !Object.hasOwn(SEARCH_ENGINES, engineKey) ||
+      !query ||
+      query.length > MAX_QUERY_LENGTH
+    ) {
+      return createResponse(
+        JSON.stringify({
+          error: `Invalid request. Use a supported engine and a query up to ${MAX_QUERY_LENGTH} characters.`,
+        }),
+        {
+          status: 400,
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
           },
-          allowedOrigin,
-        );
-      }
+        },
+        allowedOrigin,
+      );
     }
 
-    // Rate Limit Verification
     const clientIp = request.headers.get("CF-Connecting-IP") || "unknown";
     if (await isRateLimitedKV(clientIp, env.RATE_LIMIT_KV)) {
-      return createCORSResponse(
+      return createResponse(
         JSON.stringify({ error: "Too Many Requests" }),
         {
           status: 429,
           headers: {
             "Content-Type": "application/json",
-            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Cache-Control": "no-store",
             "Retry-After": "60",
           },
         },
@@ -198,41 +219,9 @@ export default {
       );
     }
 
-    // HTTP Method Validation
-    if (request.method !== "GET") {
-      return createCORSResponse(
-        JSON.stringify({ error: "Method Not Allowed" }),
-        {
-          status: 405,
-          headers: { "Content-Type": "application/json" },
-        },
-        allowedOrigin,
-      );
-    }
-
-    // Query Parameter Parsing & Validation
-    const url = new URL(request.url);
-    const engineKey = url.searchParams.get("engine")?.toLowerCase();
-    const query = url.searchParams.get("q");
-
-    if (!engineKey || !query || !(engineKey in SEARCH_ENGINES)) {
-      return createCORSResponse(
-        JSON.stringify({
-          error: 'Invalid request parameters. Specify valid "engine" and "q".',
-        }),
-        {
-          status: 400,
-          headers: {
-            "Content-Type": "application/json",
-            "Cache-Control": "no-store, no-cache, must-revalidate",
-          },
-        },
-        allowedOrigin,
-      );
-    }
-
-    // Upstream Execution
     const upstreamUrl = SEARCH_ENGINES[engineKey](encodeURIComponent(query));
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
 
     try {
       const upstreamResponse = await fetch(upstreamUrl, {
@@ -242,55 +231,87 @@ export default {
           Accept: "application/json, text/javascript, */*; q=0.01",
           "Accept-Language": "en-US,en;q=0.9",
         },
+        signal: controller.signal,
       });
 
       if (!upstreamResponse.ok) {
-        return createCORSResponse(
-          JSON.stringify({
-            error: "Upstream search engine returned an error",
-            upstreamStatus: upstreamResponse.status,
-          }),
+        return createResponse(
+          JSON.stringify({ error: "Upstream search engine returned an error" }),
           {
             status: 502,
             headers: {
               "Content-Type": "application/json",
-              "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+              "Cache-Control": "no-store",
             },
           },
           allowedOrigin,
         );
       }
 
-      const responseData = await upstreamResponse.text();
+      const contentType = upstreamResponse.headers.get("Content-Type") || "";
+      if (
+        contentType &&
+        !contentType.toLowerCase().startsWith("application/json") &&
+        !contentType.toLowerCase().startsWith("text/javascript") &&
+        !contentType.toLowerCase().startsWith("text/plain")
+      ) {
+        return createResponse(
+          JSON.stringify({ error: "Unsupported upstream response type" }),
+          {
+            status: 502,
+            headers: {
+              "Content-Type": "application/json",
+              "Cache-Control": "no-store",
+            },
+          },
+          allowedOrigin,
+        );
+      }
 
-      return createCORSResponse(
+      const responseData = await readUpstreamBody(upstreamResponse);
+      if (responseData === null) {
+        return createResponse(
+          JSON.stringify({ error: "Upstream response is too large" }),
+          {
+            status: 502,
+            headers: {
+              "Content-Type": "application/json",
+              "Cache-Control": "no-store",
+            },
+          },
+          allowedOrigin,
+        );
+      }
+
+      return createResponse(
         responseData,
         {
           status: 200,
           headers: {
-            "Content-Type":
-              upstreamResponse.headers.get("Content-Type") ||
-              "application/json",
-            "Cache-Control": "private, max-age=300, stale-while-revalidate=60",
-            "Cloudflare-CDN-Cache-Control": "max-age=300",
+            "Content-Type": contentType || "application/json",
+            "Cache-Control": "private, max-age=60",
           },
         },
         allowedOrigin,
       );
-    } catch {
-      return createCORSResponse(
-        JSON.stringify({
-          error: "Failed to connect to upstream search engine",
-        }),
+    } catch (error) {
+      const message = error instanceof Error && error.name === "AbortError"
+        ? "Upstream request timed out"
+        : "Failed to connect to upstream search engine";
+
+      return createResponse(
+        JSON.stringify({ error: message }),
         {
-          status: 500,
+          status: 502,
           headers: {
             "Content-Type": "application/json",
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Cache-Control": "no-store",
           },
         },
         allowedOrigin,
       );
+    } finally {
+      clearTimeout(timeout);
     }
   },
 };
