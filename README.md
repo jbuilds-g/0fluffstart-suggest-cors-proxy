@@ -1,20 +1,39 @@
 # 0fluffstart-suggest-cors-proxy
 
-A lightweight, zero-logs CORS proxy built for Cloudflare Workers. Designed specifically for 0FluffStart to fetch real-time search suggestions without exposing client IP addresses or keypress metadata to upstream search engines.
+A lightweight, public CORS proxy built for Cloudflare Workers. Designed specifically for 0FluffStart to fetch real-time search suggestions without exposing client IP addresses or keypress metadata to upstream search engines.
 
 ## Features
 
-- **Privacy-First:** Strips tracking headers and client IP metadata before forwarding requests.
+- **Public browser API:** No client-side secret or bearer token is required.
+- **Privacy-First:** Does not intentionally forward client IP metadata or log request data in the Worker.
 - **Multi-Engine Support:** Proxies autocomplete endpoints for Google, Bing, DuckDuckGo, and Brave.
-- **Edge Performance:** Runs on Cloudflare's global network for ultra-low latency.
-- **Rate Limiting:** Built-in KV binding support to prevent abuse.
+- **Edge Performance:** Runs on Cloudflare's global network.
+- **Abuse Protection:** KV-backed per-IP rate limiting with a 40-request/minute target.
+- **Request Hardening:** Query length limits, upstream timeouts, response-size limits, and restricted CORS origins.
 
-## Supported Providers
+## API
 
-- Google (`/google?q=query`)
-- Bing (`/bing?q=query`)
-- DuckDuckGo (`/duckduckgo?q=query`)
-- Brave (`/brave?q=query`)
+Each provider can be addressed directly by path:
+
+- Google: `/google?q=query`
+- Bing: `/bing?q=query`
+- DuckDuckGo: `/duckduckgo?q=query`
+- Brave: `/brave?q=query`
+
+The legacy query form is also supported:
+
+`/?engine=google&q=query`
+
+### CORS
+
+Allowed browser origins are:
+
+- `https://jbuilds-g.github.io`
+- Valid `chrome-extension://` origins
+- Valid `moz-extension://` origins
+- `http://localhost` and `http://127.0.0.1` development origins
+
+Requests with an unrecognized `Origin` are rejected. Requests without an `Origin` header remain usable for non-browser/server-side clients.
 
 ## Deployment
 
@@ -26,20 +45,17 @@ A lightweight, zero-logs CORS proxy built for Cloudflare Workers. Designed speci
 ### Local Setup
 
 1. Clone the repository:
-   git clone https://github.com/jbuilds-g/0fluffstart-suggest-cors-proxy.git
-   cd 0fluffstart-suggest-cors-proxy
-
-2. Install dependencies:
-   npm install
-
-3. Run locally for testing:
-   npx wrangler dev
+   `git clone https://github.com/jbuilds-g/0fluffstart-suggest-cors-proxy.git`
+2. Enter the directory:
+   `cd 0fluffstart-suggest-cors-proxy`
+3. Install dependencies:
+   `npm install`
+4. Run locally:
+   `npx wrangler dev`
 
 ### Deploy to Cloudflare
 
-Deploy directly to your Cloudflare account with a single command:
-
-npx wrangler deploy
+`npx wrangler deploy`
 
 ## License
 
