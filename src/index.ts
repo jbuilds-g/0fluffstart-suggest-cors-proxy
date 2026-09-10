@@ -33,7 +33,12 @@ function getAllowedOrigin(request: Request): string | null {
   try {
     const parsed = new URL(origin);
 
-    if (parsed.origin === "https://0fluffstart.pages.dev") {
+    if (
+      [
+        "https://0fluffstart.pages.dev",
+        "https://development.0fluffstart.pages.dev",
+      ].includes(parsed.origin)
+    ) {
       return parsed.origin;
     }
 
@@ -200,7 +205,7 @@ export default {
     const pathEngine = url.pathname.replace(/^\/+|\/+$/g, "").toLowerCase();
     const engineKey = Object.hasOwn(SEARCH_ENGINES, pathEngine)
       ? pathEngine
-      : url.searchParams.get("engine")?.trim().toLowerCase() ?? "";
+      : (url.searchParams.get("engine")?.trim().toLowerCase() ?? "");
     const query = url.searchParams.get("q")?.trim() ?? "";
 
     if (

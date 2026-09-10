@@ -29,6 +29,7 @@ The legacy query form is also supported:
 Allowed browser origins are:
 
 - `https://0fluffstart.pages.dev`
+- `https://development.0fluffstart.pages.dev`
 - Valid `chrome-extension://` origins
 - Valid `moz-extension://` origins
 - `http://localhost` and `http://127.0.0.1` development origins
